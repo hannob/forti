@@ -6,7 +6,7 @@ SPKI SHA256 hashes of private keys in the leak.
 
 More info: https://blog.hboeck.de/archives/908-Private-Keys-in-the-Fortigate-Leak.html
 
-You can also use [badkeys](https://badkeys.info/)([Git repo](
+You can also use [badkeys](https://badkeys.info/) ([Git repo](
 https://github.com/badkeys/badkeys)) to detect affected keys.
 
 Other resources
